@@ -127,7 +127,13 @@ export default function App() {
   const bleDeviceRef = useRef<any>(null);
   const seenHookEventsRef = useRef<Set<string>>(new Set());
 
-  // Live Now Playing Audio Monitor State (from Windows CoreAudio on Headphones A15)
+  // Live Now Playing Audio Monitor State (from Windows CoreAudio on Headphones A15 OR Browser Web Audio Analyser)
+  const [bridgeConnected, setBridgeConnected] = useState<boolean>(false);
+  const [browserAudioMode, setBrowserAudioMode] = useState<'none' | 'tab' | 'file'>('none');
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  const analyserAnimRef = useRef<number | null>(null);
+
   const [nowPlaying, setNowPlaying] = useState<{
     audioEndpoint: string;
     endpointConnected: boolean;
@@ -147,9 +153,9 @@ export default function App() {
   }>({
     audioEndpoint: 'Headphones (A15 - 41:42:F9:E8:1A:CE)',
     endpointConnected: true,
-    playbackStatus: 'Playing',
-    sourceApp: 'MPC-HC (Media Player Classic)',
-    title: 'กำลังตรวจจับสัญญาณเสียงจาก Windows Audio Session...',
+    playbackStatus: 'Paused',
+    sourceApp: 'Web Browser / Windows Audio',
+    title: '-',
     volumePeakPercent: 0,
     updatedAt: '-',
     sessions: [],
@@ -318,42 +324,63 @@ export default function App() {
     setSelectedCharIndex(0);
   };
 
+  // Helper: Fetch from Local Windows Bridge (works both on http://localhost:5173 AND from https://bt-setting-config01.vercel.app!)
+  const fetchA15Bridge = async (pathStr: string, options?: RequestInit): Promise<any | null> => {
+    const isLocalVite =
+      typeof window !== 'undefined' &&
+      (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+
+    const candidates = isLocalVite
+      ? [pathStr]
+      : [`http://localhost:5173${pathStr}`, `http://127.0.0.1:5173${pathStr}`];
+
+    for (const url of candidates) {
+      try {
+        const resp = await fetch(url, options);
+        if (resp.ok) {
+          const ct = resp.headers.get('content-type') || '';
+          if (ct.includes('application/json')) {
+            return await resp.json();
+          }
+        }
+      } catch {
+        // try next candidate
+      }
+    }
+    return null;
+  };
+
   // Auto-connect to Windows Hardware Bridge for A15 (MAC: 41:42:F9:E8:1A:CE on COM4)
   const connectViaWindowsA15Bridge = async () => {
-    try {
-      const resp = await fetch('/api/a15/status');
-      if (!resp.ok) return false;
-      const data = await resp.json();
-      if (data && data.connected) {
-        setIsConnected(true);
-        setIsSimulating(false);
-        setDeviceName(`${data.deviceName} (${data.macAddress})`);
-        setDeviceId(`${data.instanceId} [${data.comPort}]`);
-        setBatteryLevel(data.batteryLevel || 100);
-        if (data.nowPlaying) {
-          setNowPlaying(data.nowPlaying);
-        }
-        if (data.lockState) {
-          setMasterTouchLocked(Boolean(data.lockState.masterLocked));
-          setSensorLocks({
-            singleTap: Boolean(data.lockState.singleTap),
-            doubleTap: Boolean(data.lockState.doubleTap),
-            tripleTap: Boolean(data.lockState.tripleTap),
-            longPress: Boolean(data.lockState.longPress),
-            inEarDetect: Boolean(data.lockState.inEarDetect),
-            autoPowerOff: Boolean(data.lockState.autoPowerOff),
-          });
-          setShieldActive(Boolean(data.lockState.masterLocked));
-        }
-        populateDefaultEditableChars();
-        addLog(
-          'info',
-          `Connected directly to Windows Bluetooth Classic + SPP Bridge: A15 (MAC: ${data.macAddress}, Serial: ${data.comPort}, AVRCP Hook: ACTIVE)`
-        );
-        return true;
+    const data = await fetchA15Bridge('/api/a15/status');
+    if (data && data.connected) {
+      setBridgeConnected(true);
+      setIsConnected(true);
+      setIsSimulating(false);
+      setDeviceName(`${data.deviceName} (${data.macAddress})`);
+      setDeviceId(`${data.instanceId} [${data.comPort}]`);
+      setBatteryLevel(data.batteryLevel || 100);
+      if (data.nowPlaying && browserAudioMode === 'none') {
+        setNowPlaying(data.nowPlaying);
       }
-    } catch {
-      // Bridge unavailable
+      if (data.lockState) {
+        setMasterTouchLocked(Boolean(data.lockState.masterLocked));
+        setSensorLocks({
+          singleTap: Boolean(data.lockState.singleTap),
+          doubleTap: Boolean(data.lockState.doubleTap),
+          tripleTap: Boolean(data.lockState.tripleTap),
+          longPress: Boolean(data.lockState.longPress),
+          inEarDetect: Boolean(data.lockState.inEarDetect),
+          autoPowerOff: Boolean(data.lockState.autoPowerOff),
+        });
+        setShieldActive(Boolean(data.lockState.masterLocked));
+      }
+      populateDefaultEditableChars();
+      addLog(
+        'info',
+        `Connected directly to Windows Bluetooth Classic + SPP Bridge: A15 (MAC: ${data.macAddress}, Serial: ${data.comPort}, AVRCP Hook: ACTIVE)`
+      );
+      return true;
     }
     return false;
   };
@@ -361,28 +388,161 @@ export default function App() {
   useEffect(() => {
     connectViaWindowsA15Bridge();
     const timer = setInterval(async () => {
-      try {
-        const resp = await fetch('/api/a15/status');
-        if (!resp.ok) return;
-        const data = await resp.json();
-        if (data.nowPlaying) {
-          setNowPlaying(data.nowPlaying);
-        }
-        if (Array.isArray(data.hookEvents)) {
-          data.hookEvents.forEach((line: string) => {
-            if (!seenHookEventsRef.current.has(line)) {
-              seenHookEventsRef.current.add(line);
-              setBlockedCount((c) => c + 1);
-              addLog('shield', `[WINDOWS OS HOOK BLOCKED A15] ${line}`);
-            }
-          });
-        }
-      } catch {
-        // ignore poll errors
+      const data = await fetchA15Bridge('/api/a15/status');
+      if (!data) return;
+      setBridgeConnected(true);
+      if (data.nowPlaying && browserAudioMode === 'none') {
+        setNowPlaying(data.nowPlaying);
       }
-    }, 2000);
+      if (Array.isArray(data.hookEvents)) {
+        data.hookEvents.forEach((line: string) => {
+          if (!seenHookEventsRef.current.has(line)) {
+            seenHookEventsRef.current.add(line);
+            setBlockedCount((c) => c + 1);
+            addLog('shield', `[WINDOWS OS HOOK BLOCKED A15] ${line}`);
+          }
+        });
+      }
+    }, 1800);
     return () => clearInterval(timer);
-  }, []);
+  }, [browserAudioMode]);
+
+  // Pure Browser Audio Detector #1: Capture Tab or System Audio via getDisplayMedia (Works 100% online on Vercel!)
+  const handleDetectTabOrSystemAudio = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: true,
+      });
+
+      const audioTracks = stream.getAudioTracks();
+      const videoTracks = stream.getVideoTracks();
+      const label =
+        (audioTracks[0] && audioTracks[0].label) ||
+        (videoTracks[0] && videoTracks[0].label) ||
+        'Browser Tab / System Audio Stream';
+
+      setBrowserAudioMode('tab');
+      setIsConnected(true);
+      setShieldAndKeepAlive(true);
+      addLog('info', `[Browser Audio Monitor] Capturing live audio from: "${label}"`);
+
+      if (audioTracks.length > 0) {
+        const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+        const ctx = new AudioCtx();
+        const source = ctx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        if (analyserAnimRef.current) cancelAnimationFrame(analyserAnimRef.current);
+
+        const updateMeter = () => {
+          analyser.getByteFrequencyData(dataArray);
+          let sum = 0;
+          for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+          const avg = sum / dataArray.length;
+          const pct = Math.min(100, Math.round((avg / 140) * 100 * 10) / 10);
+          const nowStr = new Date().toTimeString().split(' ')[0];
+
+          setNowPlaying({
+            audioEndpoint: 'Headphones (A15 - Web Audio Output)',
+            endpointConnected: true,
+            playbackStatus: pct > 0.8 ? 'Playing' : 'Paused',
+            sourceApp: 'Google Chrome (Tab / System Share)',
+            title: label,
+            volumePeakPercent: pct,
+            updatedAt: nowStr,
+            sessions: [],
+          });
+          analyserAnimRef.current = requestAnimationFrame(updateMeter);
+        };
+        updateMeter();
+      } else {
+        const nowStr = new Date().toTimeString().split(' ')[0];
+        setNowPlaying({
+          audioEndpoint: 'Headphones (A15 - Web Audio Output)',
+          endpointConnected: true,
+          playbackStatus: 'Playing',
+          sourceApp: 'Google Chrome (Screen/Tab Share)',
+          title: label,
+          volumePeakPercent: 45,
+          updatedAt: nowStr,
+          sessions: [],
+        });
+      }
+    } catch (err: any) {
+      addLog('warn', `Tab/System Audio Capture cancelled: ${err?.message || String(err)}`);
+    }
+  };
+
+  // Pure Browser Audio Detector #2: Play Local Audio File directly inside the Web App with Real-time Analyser & A15 Lock
+  const handleLocalFileSelected = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setBrowserAudioMode('file');
+    setIsConnected(true);
+    setShieldAndKeepAlive(true);
+
+    const url = URL.createObjectURL(file);
+    if (!audioPlayerRef.current) {
+      audioPlayerRef.current = new Audio();
+    }
+    const audio = audioPlayerRef.current;
+    audio.src = url;
+    audio.play();
+
+    addLog('info', `[Built-in A15 Protected Player] Now playing: "${file.name}"`);
+
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new AudioCtx();
+      const srcNode = ctx.createMediaElementSource(audio);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 256;
+      srcNode.connect(analyser);
+      analyser.connect(ctx.destination);
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+      if (analyserAnimRef.current) cancelAnimationFrame(analyserAnimRef.current);
+
+      const updateFileMeter = () => {
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
+        const avg = sum / dataArray.length;
+        const pct = audio.paused ? 0 : Math.min(100, Math.round((avg / 128) * 100 * 10) / 10);
+        const nowStr = new Date().toTimeString().split(' ')[0];
+
+        setNowPlaying({
+          audioEndpoint: 'Headphones (A15 - Protected Web Player)',
+          endpointConnected: true,
+          playbackStatus: audio.paused ? 'Paused' : 'Playing',
+          sourceApp: 'Google Chrome (Built-in A15 Player)',
+          title: file.name,
+          volumePeakPercent: pct,
+          updatedAt: nowStr,
+          sessions: [],
+        });
+        analyserAnimRef.current = requestAnimationFrame(updateFileMeter);
+      };
+      updateFileMeter();
+    } catch {
+      const nowStr = new Date().toTimeString().split(' ')[0];
+      setNowPlaying({
+        audioEndpoint: 'Headphones (A15 - Protected Web Player)',
+        endpointConnected: true,
+        playbackStatus: 'Playing',
+        sourceApp: 'Google Chrome (Built-in A15 Player)',
+        title: file.name,
+        volumePeakPercent: 60,
+        updatedAt: nowStr,
+        sessions: [],
+      });
+    }
+  };
 
   // Connect specifically to "A15" via Windows Hardware Bridge first, or fallback to Web Bluetooth
   const connectBluetoothDevice = async (filterA15Only: boolean) => {
@@ -524,26 +684,21 @@ export default function App() {
     hexPayload: string,
     stringPayload: string
   ) => {
-    try {
-      const resp = await fetch('/api/a15/lock', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          lockState: nextLockState,
-          hexPayload,
-          stringPayload,
-        }),
-      });
-      if (resp.ok) {
-        const resData = await resp.json();
-        addLog(
-          'tx',
-          `[WINDOWS BRIDGE -> A15 COM4 & OS HOOK] ${resData.comResult} | HEX: ${hexPayload} | STR: "${stringPayload}"`
-        );
-        return true;
-      }
-    } catch {
-      // ignore if offline
+    const resData = await fetchA15Bridge('/api/a15/lock', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        lockState: nextLockState,
+        hexPayload,
+        stringPayload,
+      }),
+    });
+    if (resData && resData.ok) {
+      addLog(
+        'tx',
+        `[WINDOWS BRIDGE -> A15 COM4 & OS HOOK] ${resData.comResult} | HEX: ${hexPayload} | STR: "${stringPayload}"`
+      );
+      return true;
     }
     return false;
   };
@@ -1001,11 +1156,17 @@ export default function App() {
       {/* Main Content Container */}
       <main className="max-w-7xl mx-auto w-full px-4 py-6 flex-1 space-y-5">
         {/* Green-Bordered Live Audio & Now Playing Marquee Bar (Exact position requested by user) */}
-        <section className="rounded-xl border-2 border-emerald-500 bg-emerald-950/30 dark:bg-emerald-950/40 px-3.5 py-2.5 shadow-md shadow-emerald-500/10 flex items-center gap-3 overflow-hidden">
+        <section className="rounded-xl border-2 border-emerald-500 bg-emerald-950/30 dark:bg-emerald-950/40 px-3.5 py-2.5 shadow-md shadow-emerald-500/10 flex flex-wrap lg:flex-nowrap items-center gap-3 overflow-hidden">
           {/* Left Fixed Status Badge */}
           <div className="flex items-center gap-2 shrink-0 pr-3 border-r border-emerald-500/40">
             <span
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-extrabold tracking-wide ${
+              onClick={() => {
+                if (browserAudioMode === 'file' && audioPlayerRef.current) {
+                  if (audioPlayerRef.current.paused) audioPlayerRef.current.play();
+                  else audioPlayerRef.current.pause();
+                }
+              }}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-extrabold tracking-wide cursor-pointer ${
                 nowPlaying.playbackStatus === 'Playing'
                   ? 'bg-emerald-500 text-slate-950 shadow-sm shadow-emerald-400/50'
                   : 'bg-amber-500 text-slate-950'
@@ -1027,7 +1188,7 @@ export default function App() {
             <div className="hidden sm:flex items-center gap-1.5 bg-slate-900/80 px-2.5 py-1 rounded-lg border border-emerald-500/30">
               <div className="w-16 h-2 bg-slate-800 rounded-full overflow-hidden">
                 <div
-                  className="h-full bg-gradient-to-r from-emerald-400 to-lime-300 transition-all duration-300"
+                  className="h-full bg-gradient-to-r from-emerald-400 to-lime-300 transition-all duration-150"
                   style={{ width: `${Math.min(100, Math.max(4, nowPlaying.volumePeakPercent))}%` }}
                 />
               </div>
@@ -1038,14 +1199,14 @@ export default function App() {
           </div>
 
           {/* Scrolling Marquee Container */}
-          <div className="flex-1 overflow-hidden relative">
+          <div className="flex-1 overflow-hidden relative min-w-[200px]">
             <div className="animate-marquee items-center gap-10 text-xs md:text-sm font-medium text-emerald-100">
               {[0, 1].map((dupIdx) => (
                 <div key={dupIdx} className="inline-flex items-center gap-6 pr-12">
                   <span className="inline-flex items-center gap-1.5">
                     <span className="text-emerald-400 font-bold">🎵 {t('liveTrackLabel')}:</span>
                     <span className="font-extrabold text-white bg-emerald-500/20 px-2 py-0.5 rounded border border-emerald-500/30">
-                      {nowPlaying.title}
+                      {nowPlaying.title === '-' ? t('onlineWaitingTrack') : nowPlaying.title}
                     </span>
                   </span>
 
@@ -1068,6 +1229,29 @@ export default function App() {
                 </div>
               ))}
             </div>
+          </div>
+
+          {/* Right Quick Audio Source Buttons (Works 100% online on Vercel & locally) */}
+          <div className="flex items-center gap-1.5 shrink-0 pl-2 border-l border-emerald-500/30">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="audio/*,video/*"
+              onChange={handleLocalFileSelected}
+              className="hidden"
+            />
+            <button
+              onClick={handleDetectTabOrSystemAudio}
+              className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[11px] transition shadow-sm"
+            >
+              {t('btnDetectTabAudio')}
+            </button>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="px-2.5 py-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] transition shadow-sm"
+            >
+              {t('btnPlayLocalFile')}
+            </button>
           </div>
         </section>
         {/* Browser Warning if Web Bluetooth is unavailable (e.g. accessed via 192.168.x.x HTTP instead of localhost) */}

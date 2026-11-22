@@ -7,6 +7,13 @@ import path from 'path';
 let hookProcess: any = null;
 let mediaProbeProcess: any = null;
 
+function setCorsHeaders(res: any) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Private-Network', 'true');
+}
+
 function startWindowsA15Hook(rootDir: string) {
   if (!hookProcess) {
     const scriptPath = path.join(rootDir, 'a15-os-hook.ps1');
@@ -86,7 +93,14 @@ export default defineConfig({
         // Start the Windows OS-level AVRCP Ghost-Touch Hook & Live Audio Probe daemons
         startWindowsA15Hook(rootDir);
 
-        server.middlewares.use('/api/a15/status', (_req, res) => {
+        server.middlewares.use('/api/a15/status', (req, res) => {
+          setCorsHeaders(res);
+          if (req.method === 'OPTIONS') {
+            res.statusCode = 204;
+            res.end();
+            return;
+          }
+
           startWindowsA15Hook(rootDir);
           let lockState = {
             masterLocked: true,
@@ -182,6 +196,13 @@ export default defineConfig({
         });
 
         server.middlewares.use('/api/a15/lock', (req, res) => {
+          setCorsHeaders(res);
+          if (req.method === 'OPTIONS') {
+            res.statusCode = 204;
+            res.end();
+            return;
+          }
+
           let body = '';
           req.on('data', (chunk) => {
             body += chunk;
@@ -228,5 +249,6 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    cors: true,
   },
 });
